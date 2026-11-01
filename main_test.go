@@ -324,3 +324,43 @@ func TestSubcommandsEndToEnd(t *testing.T) {
 	}
 }
 
+func TestConcurrentAtomicMutationsUnderLock(t *testing.T) {
+	spacePath := filepath.Join(t.TempDir(), "concurrent_space.json")
+	space := tupleSpace{path: spacePath}
+
+	const workers = 10
+	const opsPerWorker = 20
+
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func(workerID int) {
+			for j := 0; j < opsPerWorker; j++ {
+				tuple := json.RawMessage([]byte(`{"worker":` + string(rune('0'+workerID%10)) + `}`))
+				if err := space.mutate(func(state *fileState) error {
+					state.Tuples = append(state.Tuples, tuple)
+					return nil
+				}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}(i)
+	}
+
+	for i := 0; i < workers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("worker failed: %v", err)
+		}
+	}
+
+	count, err := space.count(nil, nil)
+	if err != nil {
+		t.Fatalf("count failed: %v", err)
+	}
+	if count != workers*opsPerWorker {
+		t.Fatalf("expected %d tuples, got %d", workers*opsPerWorker, count)
+	}
+}
+
+
