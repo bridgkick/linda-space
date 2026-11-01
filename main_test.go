@@ -283,12 +283,23 @@ func TestSubcommandsEndToEnd(t *testing.T) {
 	}
 
 	// 3. rd with -k only (no template argument)
-	if err := runTake([]string{"--space", spacePath, "-k", "meta.env=dev"}, false); err != nil {
+	oldStdout := os.Stdout
+	_, w, _ := os.Pipe()
+	os.Stdout = w
+	err = runTake([]string{"--space", spacePath, "-k", "meta.env=dev"}, false)
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
 		t.Fatalf("rd with -k failed: %v", err)
 	}
 
 	// 4. in with -k only (no template argument)
-	if err := runTake([]string{"--space", spacePath, "-k", "meta.env=dev"}, true); err != nil {
+	_, w, _ = os.Pipe()
+	os.Stdout = w
+	err = runTake([]string{"--space", spacePath, "-k", "meta.env=dev"}, true)
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
 		t.Fatalf("in with -k failed: %v", err)
 	}
 
