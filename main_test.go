@@ -52,30 +52,30 @@ func TestSpaceOperations(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	count, err := space.count(json.RawMessage(`{"type":"job"}`))
+	count, err := space.count(json.RawMessage(`{"type":"job"}`), nil)
 	if err != nil || count != 2 {
 		t.Fatalf("count = %d, %v; want 2", count, err)
 	}
-	got, found, err := space.find(context.Background(), json.RawMessage(`{"status":"raw"}`), false)
+	got, found, err := space.find(context.Background(), json.RawMessage(`{"status":"raw"}`), nil, false)
 	if err != nil || !found {
 		t.Fatalf("rd = %s, found=%v, err=%v", got, found, err)
 	}
 	if string(got) != `{"type":"job","status":"raw","meta":{"team":"infra"}}` {
 		t.Fatalf("rd returned %s", got)
 	}
-	got, found, err = space.find(context.Background(), json.RawMessage(`{"status":"raw"}`), true)
+	got, found, err = space.find(context.Background(), json.RawMessage(`{"status":"raw"}`), nil, true)
 	if err != nil || !found {
 		t.Fatalf("in = %s, found=%v, err=%v", got, found, err)
 	}
-	count, err = space.count(nil)
+	count, err = space.count(nil, nil)
 	if err != nil || count != 2 {
 		t.Fatalf("count after in = %d, %v; want 2", count, err)
 	}
-	removed, err := space.clip(json.RawMessage(`{"type":"job"}`))
+	removed, err := space.clip(json.RawMessage(`{"type":"job"}`), nil)
 	if err != nil || removed != 1 {
 		t.Fatalf("clip = %d, %v; want 1", removed, err)
 	}
-	count, err = space.count(nil)
+	count, err = space.count(nil, nil)
 	if err != nil || count != 1 {
 		t.Fatalf("count after clip = %d, %v; want 1", count, err)
 	}
@@ -93,7 +93,7 @@ func TestBlockingFindSeesTupleWrittenByAnotherOperation(t *testing.T) {
 	}, 1)
 	go func() {
 		for {
-			raw, found, err := space.find(ctx, json.RawMessage(`{"kind":"ready"}`), true)
+			raw, found, err := space.find(ctx, json.RawMessage(`{"kind":"ready"}`), nil, true)
 			if err != nil || found {
 				result <- struct {
 					raw   json.RawMessage
@@ -134,7 +134,7 @@ func TestReadStateRejectsNonTuple(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"tuples":[1]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := tupleSpace{path: path}.count(nil)
+	_, err := tupleSpace{path: path}.count(nil, nil)
 	if err == nil {
 		t.Fatal("expected invalid tuple error")
 	}
