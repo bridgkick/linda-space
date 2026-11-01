@@ -7,14 +7,20 @@ import (
 )
 
 type keyValueFilter struct {
-	path  string
-	value string
+	path       string
+	rawVal     string
+	parsedVal  any
+	hasParsed  bool
 }
 
 type keyValueFilters []keyValueFilter
 
 func (k *keyValueFilters) String() string {
-	return fmt.Sprint(*k)
+	var parts []string
+	for _, f := range *k {
+		parts = append(parts, f.path+"="+f.rawVal)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (k *keyValueFilters) Set(value string) error {
@@ -22,9 +28,17 @@ func (k *keyValueFilters) Set(value string) error {
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid key-value filter %q, expected key=value", value)
 	}
+	rawVal := strings.TrimSpace(parts[1])
+	var parsedVal any
+	dec := json.NewDecoder(strings.NewReader(rawVal))
+	dec.UseNumber()
+	hasParsed := dec.Decode(&parsedVal) == nil
+
 	*k = append(*k, keyValueFilter{
-		path:  strings.TrimSpace(parts[0]),
-		value: strings.TrimSpace(parts[1]),
+		path:      strings.TrimSpace(parts[0]),
+		rawVal:    rawVal,
+		parsedVal: parsedVal,
+		hasParsed: hasParsed,
 	})
 	return nil
 }
@@ -45,11 +59,9 @@ func matchKeyValues(filters keyValueFilters, candidate json.RawMessage) (bool, e
 		if !found {
 			return false, nil
 		}
-		var targetVal any
-		dec2 := json.NewDecoder(strings.NewReader(f.value))
-		dec2.UseNumber()
-		if err := dec2.Decode(&targetVal); err != nil {
-			targetVal = f.value
+		targetVal := f.parsedVal
+		if !f.hasParsed {
+			targetVal = f.rawVal
 		}
 		if !jsonValueEqual(targetVal, val) {
 			return false, nil
