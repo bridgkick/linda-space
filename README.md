@@ -49,6 +49,25 @@ linda-space in --space /tmp/jobs.json --file template.json
 
 Templates recursively match subsets of JSON objects: every key in a template must be present with the same value in the candidate, while extra candidate keys are allowed. Nested objects use the same rule. Arrays must have the same length and match positionally. Top-level tuples can be JSON objects or arrays; scalar top-level values are rejected.
 
+### Key-Value Filtering (`-k` / `--key`)
+
+Tuples can also be filtered using dot-path key-value flags (`-k <path>=<value>` or `--key <path>=<value>`). Key filters can be repeated and used on their own (without a JSON template) or combined with a template:
+
+```sh
+# Read or take tuples solely using dot-path filters
+linda-space rd --space /tmp/jobs.json -k status=raw -k meta.team=infra
+linda-space in --space /tmp/jobs.json -k status=raw
+
+# Count and clip with key filters
+linda-space count --space /tmp/jobs.json -k status=done
+linda-space clip --space /tmp/jobs.json -k status=cancelled
+```
+
+Scalar values in filter targets (e.g. numbers, booleans, null) are parsed as JSON scalars with fallback to raw strings (e.g., `-k priority=2`, `-k active=true`, `-k ref=null`, `-k status=raw`).
+
+> **Note on dot escaping:** Dot-path key traversal does not yet support escaped dots (`.`). Traversal splits paths on literal `.` characters. Literal dot escaping in key names will be implemented later via slash-escaping (`\.`).
+
+
 ## Blocking and exit status
 
 `in` and `rd` do an immediate check by default. Add `--wait` to long-poll until a matching tuple arrives:

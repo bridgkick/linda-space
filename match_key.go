@@ -6,11 +6,23 @@ import (
 	"strings"
 )
 
+// keyValueFilter stores a parsed dot-path filter (e.g. -k meta.team=infra).
+//
+// Target values (rawVal) are pre-parsed once at flag parsing time into parsedVal
+// (using json.Decoder with UseNumber) to avoid re-decoding inside inner matching loops
+// over candidate tuples.
+//
+// Coercion Behavior:
+// JSON scalar value coercion (parsing target values as JSON numbers/bools/nulls with
+// string fallback) is intentional and left as-is per user preference. For instance,
+// -k priority=2 parses as json.Number("2"), -k active=true parses as bool true,
+// -k ref=null parses as nil, while unquoted strings like -k status=raw fail JSON decoding
+// and fall back cleanly to raw strings.
 type keyValueFilter struct {
-	path       string
-	rawVal     string
-	parsedVal  any
-	hasParsed  bool
+	path      string
+	rawVal    string
+	parsedVal any
+	hasParsed bool
 }
 
 type keyValueFilters []keyValueFilter
@@ -23,6 +35,9 @@ func (k *keyValueFilters) String() string {
 	return strings.Join(parts, ", ")
 }
 
+// Set parses a key=value filter string. Target values are decoded once here as JSON scalars
+// (number, boolean, null, object, array) with fallback to raw string, caching the result
+// in parsedVal so candidate matching doesn't repeat JSON decoding.
 func (k *keyValueFilters) Set(value string) error {
 	parts := strings.SplitN(value, "=", 2)
 	if len(parts) != 2 {
@@ -43,6 +58,9 @@ func (k *keyValueFilters) Set(value string) error {
 	return nil
 }
 
+// matchKeyValues checks if a candidate tuple satisfies all dot-path key-value filters.
+// Filter target values are pre-parsed once during flag parsing, avoiding re-decoding
+// inside this candidate evaluation loop.
 func matchKeyValues(filters keyValueFilters, candidate json.RawMessage) (bool, error) {
 	if len(filters) == 0 {
 		return true, nil
@@ -70,6 +88,10 @@ func matchKeyValues(filters keyValueFilters, candidate json.RawMessage) (bool, e
 	return true, nil
 }
 
+// getNestedValue traverses nested maps using dot-separated keys.
+//
+// NOTE: Dot-path key traversal does not yet support escaped dots ('.').
+// Literal dot escaping in key names will be implemented later via slash-escaping ('\.').
 func getNestedValue(obj any, dotPath string) (any, bool) {
 	parts := strings.Split(dotPath, ".")
 	curr := obj
@@ -86,3 +108,4 @@ func getNestedValue(obj any, dotPath string) (any, bool) {
 	}
 	return curr, true
 }
+

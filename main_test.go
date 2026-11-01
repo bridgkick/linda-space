@@ -157,3 +157,159 @@ func TestNoMatchErrorIsSentinel(t *testing.T) {
 		t.Fatal("errNoMatch should be a sentinel")
 	}
 }
+
+func TestResolvePattern(t *testing.T) {
+	t.Run("empty without flags or pattern rejected when not allowed", func(t *testing.T) {
+		f := &commandFlags{}
+		_, err := resolvePattern(nil, f, false)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("empty with key flags allowed even when allowEmpty is false", func(t *testing.T) {
+		f := &commandFlags{}
+		if err := f.keys.Set("foo=bar"); err != nil {
+			t.Fatal(err)
+		}
+		pattern, err := resolvePattern(nil, f, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pattern != nil {
+			t.Fatalf("expected nil pattern, got %s", pattern)
+		}
+	})
+
+	t.Run("empty when allowEmpty is true", func(t *testing.T) {
+		f := &commandFlags{}
+		pattern, err := resolvePattern(nil, f, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pattern != nil {
+			t.Fatalf("expected nil pattern, got %s", pattern)
+		}
+	})
+
+	t.Run("positional json with key flags", func(t *testing.T) {
+		f := &commandFlags{}
+		if err := f.keys.Set("meta.team=infra"); err != nil {
+			t.Fatal(err)
+		}
+		pattern, err := resolvePattern([]string{`{"type":"job"}`}, f, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(pattern) != `{"type":"job"}` {
+			t.Fatalf("expected {\"type\":\"job\"}, got %s", pattern)
+		}
+	})
+
+	t.Run("reject non-tuple pattern", func(t *testing.T) {
+		f := &commandFlags{}
+		_, err := resolvePattern([]string{`"scalar"`}, f, false)
+		if !errors.Is(err, errBadPattern) {
+			t.Fatalf("expected errBadPattern, got %v", err)
+		}
+	})
+}
+
+func TestTupleMatchesCombinedTemplateAndKeyFilters(t *testing.T) {
+	var keys keyValueFilters
+	if err := keys.Set("meta.team=infra"); err != nil {
+		t.Fatal(err)
+	}
+	if err := keys.Set("priority=1"); err != nil {
+		t.Fatal(err)
+	}
+
+	tuple := json.RawMessage(`{"type":"job","status":"pending","priority":1,"meta":{"team":"infra"}}`)
+
+	// Both template and keys match
+	ok, err := tupleMatches(json.RawMessage(`{"type":"job"}`), keys, tuple)
+	if err != nil || !ok {
+		t.Fatalf("expected match, got ok=%v err=%v", ok, err)
+	}
+
+	// Template mismatches
+	ok, err = tupleMatches(json.RawMessage(`{"type":"other"}`), keys, tuple)
+	if err != nil || ok {
+		t.Fatalf("expected mismatch on template, got ok=%v err=%v", ok, err)
+	}
+
+	// Keys mismatch
+	var mismatchKeys keyValueFilters
+	mismatchKeys.Set("meta.team=backend")
+	ok, err = tupleMatches(json.RawMessage(`{"type":"job"}`), mismatchKeys, tuple)
+	if err != nil || ok {
+		t.Fatalf("expected mismatch on keys, got ok=%v err=%v", ok, err)
+	}
+
+	// No template, only keys
+	ok, err = tupleMatches(nil, keys, tuple)
+	if err != nil || !ok {
+		t.Fatalf("expected match with nil template, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSubcommandsEndToEnd(t *testing.T) {
+	spacePath := filepath.Join(t.TempDir(), "e2e_space.json")
+
+	// 1. out tuples
+	if err := runOut([]string{"--space", spacePath, `{"type":"task","status":"open","priority":1,"meta":{"env":"prod"}}`}); err != nil {
+		t.Fatalf("out 1 failed: %v", err)
+	}
+	if err := runOut([]string{"--space", spacePath, `{"type":"task","status":"open","priority":2,"meta":{"env":"dev"}}`}); err != nil {
+		t.Fatalf("out 2 failed: %v", err)
+	}
+	if err := runOut([]string{"--space", spacePath, `{"type":"task","status":"done","priority":1,"meta":{"env":"prod"}}`}); err != nil {
+		t.Fatalf("out 3 failed: %v", err)
+	}
+
+	// 2. count with -k only
+	space := tupleSpace{path: spacePath}
+	var fKeyOpen keyValueFilters
+	fKeyOpen.Set("status=open")
+	count, err := space.count(nil, fKeyOpen)
+	if err != nil || count != 2 {
+		t.Fatalf("count open = %d, %v; want 2", count, err)
+	}
+
+	// count with -k and template
+	count, err = space.count(json.RawMessage(`{"type":"task"}`), fKeyOpen)
+	if err != nil || count != 2 {
+		t.Fatalf("count open with template = %d, %v; want 2", count, err)
+	}
+
+	// 3. rd with -k only (no template argument)
+	if err := runTake([]string{"--space", spacePath, "-k", "meta.env=dev"}, false); err != nil {
+		t.Fatalf("rd with -k failed: %v", err)
+	}
+
+	// 4. in with -k only (no template argument)
+	if err := runTake([]string{"--space", spacePath, "-k", "meta.env=dev"}, true); err != nil {
+		t.Fatalf("in with -k failed: %v", err)
+	}
+
+	// Verify it was removed
+	count, err = space.count(nil, nil)
+	if err != nil || count != 2 {
+		t.Fatalf("count after in = %d; want 2", count)
+	}
+
+	// 5. clip with -k only
+	var fKeyProd keyValueFilters
+	fKeyProd.Set("meta.env=prod")
+	clipped, err := space.clip(nil, fKeyProd)
+	if err != nil || clipped != 2 {
+		t.Fatalf("clip = %d, %v; want 2", clipped, err)
+	}
+
+	// Verify space is empty
+	count, err = space.count(nil, nil)
+	if err != nil || count != 0 {
+		t.Fatalf("count after clip = %d; want 0", count)
+	}
+}
+

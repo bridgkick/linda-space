@@ -118,7 +118,7 @@ func runTake(args []string, remove bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	pattern, err := resolvePattern(fs.Args(), &f, false)
+	pattern, err := resolvePattern(fs.Args(), &f, true)
 	if err != nil {
 		return err
 	}
@@ -211,17 +211,15 @@ func addCommonFlags(fs *flag.FlagSet, f *commandFlags) {
 }
 
 func resolvePattern(args []string, f *commandFlags, allowEmpty bool) (json.RawMessage, error) {
+	hasKeyFilters := len(f.keys) > 0
 	if len(args) == 0 && f.input == "" && f.inputFile == "" {
-		if allowEmpty && len(f.keys) > 0 {
-			return nil, nil
-		}
-		if allowEmpty {
+		if allowEmpty || hasKeyFilters {
 			return nil, nil
 		}
 	}
 	pattern, err := readJSONInput(args, f.input, f.inputFile, false)
 	if err != nil {
-		if allowEmpty && len(f.keys) > 0 && (len(args) == 0 && f.input == "" && f.inputFile == "") {
+		if (allowEmpty || hasKeyFilters) && (len(args) == 0 && f.input == "" && f.inputFile == "") {
 			return nil, nil
 		}
 		return nil, err
