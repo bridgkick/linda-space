@@ -465,24 +465,45 @@ func withLockedFile(path string, exclusive bool, fn func(*os.File, *fileState) e
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create space directory: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return fmt.Errorf("open space: %w", err)
-	}
-	defer file.Close()
 	lock := syscall.LOCK_SH
 	if exclusive {
 		lock = syscall.LOCK_EX
 	}
-	if err := syscall.Flock(int(file.Fd()), lock); err != nil {
-		return fmt.Errorf("lock space: %w", err)
+	for {
+		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			return fmt.Errorf("open space: %w", err)
+		}
+		if err := syscall.Flock(int(file.Fd()), lock); err != nil {
+			file.Close()
+			return fmt.Errorf("lock space: %w", err)
+		}
+		fiFile, err := file.Stat()
+		if err != nil {
+			syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			file.Close()
+			return fmt.Errorf("stat space file descriptor: %w", err)
+		}
+		fiPath, err := os.Stat(path)
+		if err != nil {
+			// If the file was replaced or removed concurrently right before stat, retry.
+			syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			file.Close()
+			continue
+		}
+		if os.SameFile(fiFile, fiPath) {
+			defer file.Close()
+			defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			state, err := readState(file)
+			if err != nil {
+				return err
+			}
+			return fn(file, state)
+		}
+		// File was atomically replaced before lock was acquired; retry with the new file.
+		syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		file.Close()
 	}
-	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-	state, err := readState(file)
-	if err != nil {
-		return err
-	}
-	return fn(file, state)
 }
 
 func readState(file *os.File) (*fileState, error) {
@@ -513,16 +534,39 @@ func writeState(file *os.File, state *fileState) error {
 	if err != nil {
 		return fmt.Errorf("encode space: %w", err)
 	}
-	if err := file.Truncate(0); err != nil {
-		return fmt.Errorf("truncate space: %w", err)
+	destPath := file.Name()
+	dir := filepath.Dir(destPath)
+	tempFile, err := os.CreateTemp(dir, filepath.Base(destPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp space file: %w", err)
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek space for write: %w", err)
+	tempPath := tempFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tempFile.Close()
+			os.Remove(tempPath)
+		}
+	}()
+
+	if _, err := tempFile.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write temp space: %w", err)
 	}
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("write space: %w", err)
+	if err := tempFile.Sync(); err != nil {
+		return fmt.Errorf("fsync temp space: %w", err)
 	}
-	return file.Sync()
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temp space: %w", err)
+	}
+	if err := os.Rename(tempPath, destPath); err != nil {
+		return fmt.Errorf("rename temp space: %w", err)
+	}
+	cleanup = false
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }
 
 func matches(pattern, candidate json.RawMessage) (bool, error) {
