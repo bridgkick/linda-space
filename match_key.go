@@ -72,20 +72,25 @@ func matchKeyValues(filters keyValueFilters, candidate json.RawMessage) (bool, e
 		return false, fmt.Errorf("decode candidate: %w", err)
 	}
 
+	return matchParsedKeyValues(filters, c), nil
+}
+
+// matchParsedKeyValues checks if an already-decoded candidate tuple satisfies all dot-path key-value filters.
+func matchParsedKeyValues(filters keyValueFilters, c any) bool {
 	for _, f := range filters {
 		val, found := getNestedValue(c, f.path)
 		if !found {
-			return false, nil
+			return false
 		}
 		targetVal := f.parsedVal
 		if !f.hasParsed {
 			targetVal = f.rawVal
 		}
 		if !jsonValueEqual(targetVal, val) {
-			return false, nil
+			return false
 		}
 	}
-	return true, nil
+	return true
 }
 
 // getNestedValue traverses nested maps using dot-separated keys.

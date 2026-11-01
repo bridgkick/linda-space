@@ -324,12 +324,31 @@ func (s tupleSpace) mutate(fn func(*fileState) error) error {
 	})
 }
 
+// decodeValue decodes JSON raw bytes using UseNumber.
+func decodeValue(raw json.RawMessage) (any, error) {
+	var val any
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	if err := dec.Decode(&val); err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
 func (s tupleSpace) find(ctx context.Context, pattern json.RawMessage, keys keyValueFilters, remove bool) (json.RawMessage, bool, error) {
 	var result json.RawMessage
 	var found bool
+	var decodedPattern any
+	if pattern != nil {
+		var err error
+		decodedPattern, err = decodeValue(pattern)
+		if err != nil {
+			return nil, false, fmt.Errorf("decode template: %w", err)
+		}
+	}
 	err := withLockedFile(s.path, remove, func(file *os.File, state *fileState) error {
 		for i, candidate := range state.Tuples {
-			ok, err := tupleMatches(pattern, keys, candidate)
+			ok, err := tupleMatchesDecoded(decodedPattern, keys, candidate)
 			if err != nil {
 				return err
 			}
@@ -351,9 +370,17 @@ func (s tupleSpace) find(ctx context.Context, pattern json.RawMessage, keys keyV
 
 func (s tupleSpace) count(pattern json.RawMessage, keys keyValueFilters) (int, error) {
 	count := 0
+	var decodedPattern any
+	if pattern != nil {
+		var err error
+		decodedPattern, err = decodeValue(pattern)
+		if err != nil {
+			return 0, fmt.Errorf("decode template: %w", err)
+		}
+	}
 	err := withLockedFile(s.path, false, func(_ *os.File, state *fileState) error {
 		for _, candidate := range state.Tuples {
-			ok, err := tupleMatches(pattern, keys, candidate)
+			ok, err := tupleMatchesDecoded(decodedPattern, keys, candidate)
 			if err != nil {
 				return err
 			}
@@ -368,10 +395,18 @@ func (s tupleSpace) count(pattern json.RawMessage, keys keyValueFilters) (int, e
 
 func (s tupleSpace) clip(pattern json.RawMessage, keys keyValueFilters) (int, error) {
 	removed := 0
+	var decodedPattern any
+	if pattern != nil {
+		var err error
+		decodedPattern, err = decodeValue(pattern)
+		if err != nil {
+			return 0, fmt.Errorf("decode template: %w", err)
+		}
+	}
 	err := withLockedFile(s.path, true, func(file *os.File, state *fileState) error {
 		kept := state.Tuples[:0]
 		for _, candidate := range state.Tuples {
-			ok, err := tupleMatches(pattern, keys, candidate)
+			ok, err := tupleMatchesDecoded(decodedPattern, keys, candidate)
 			if err != nil {
 				return err
 			}
@@ -391,16 +426,33 @@ func (s tupleSpace) clip(pattern json.RawMessage, keys keyValueFilters) (int, er
 }
 
 func tupleMatches(pattern json.RawMessage, keys keyValueFilters, candidate json.RawMessage) (bool, error) {
+	var decodedPattern any
 	if pattern != nil {
-		ok, err := matches(pattern, candidate)
-		if err != nil || !ok {
-			return false, err
+		var err error
+		decodedPattern, err = decodeValue(pattern)
+		if err != nil {
+			return false, fmt.Errorf("decode template: %w", err)
+		}
+	}
+	return tupleMatchesDecoded(decodedPattern, keys, candidate)
+}
+
+func tupleMatchesDecoded(pattern any, keys keyValueFilters, candidate json.RawMessage) (bool, error) {
+	if pattern == nil && len(keys) == 0 {
+		return true, nil
+	}
+	c, err := decodeValue(candidate)
+	if err != nil {
+		return false, fmt.Errorf("decode tuple: %w", err)
+	}
+	if pattern != nil {
+		if !subsetMatch(pattern, c) {
+			return false, nil
 		}
 	}
 	if len(keys) > 0 {
-		ok, err := matchKeyValues(keys, candidate)
-		if err != nil || !ok {
-			return false, err
+		if !matchParsedKeyValues(keys, c) {
+			return false, nil
 		}
 	}
 	return true, nil
@@ -474,15 +526,12 @@ func writeState(file *os.File, state *fileState) error {
 }
 
 func matches(pattern, candidate json.RawMessage) (bool, error) {
-	var p, c any
-	dec := json.NewDecoder(strings.NewReader(string(pattern)))
-	dec.UseNumber()
-	if err := dec.Decode(&p); err != nil {
+	p, err := decodeValue(pattern)
+	if err != nil {
 		return false, fmt.Errorf("decode template: %w", err)
 	}
-	dec = json.NewDecoder(strings.NewReader(string(candidate)))
-	dec.UseNumber()
-	if err := dec.Decode(&c); err != nil {
+	c, err := decodeValue(candidate)
+	if err != nil {
 		return false, fmt.Errorf("decode tuple: %w", err)
 	}
 	return subsetMatch(p, c), nil
