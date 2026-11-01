@@ -45,6 +45,7 @@ type commandFlags struct {
 	wait      time.Duration
 	fail      bool
 	pretty    bool
+	keys      keyValueFilters
 }
 
 func main() {
@@ -117,12 +118,9 @@ func runTake(args []string, remove bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	payload, err := readJSONInput(fs.Args(), f.input, f.inputFile, false)
+	pattern, err := resolvePattern(fs.Args(), &f, true)
 	if err != nil {
 		return err
-	}
-	if !isTuple(payload) {
-		return errBadPattern
 	}
 	space := tupleSpace{path: f.space}
 	ctx := context.Background()
@@ -132,7 +130,7 @@ func runTake(args []string, remove bool) error {
 		defer cancel()
 	}
 	for {
-		result, found, err := space.find(ctx, payload, remove)
+		result, found, err := space.find(ctx, pattern, f.keys, remove)
 		if err != nil {
 			return err
 		}
@@ -165,19 +163,12 @@ func runCount(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	var pattern json.RawMessage
-	var err error
-	if len(fs.Args()) > 0 || f.input != "" || f.inputFile != "" {
-		pattern, err = readJSONInput(fs.Args(), f.input, f.inputFile, false)
-		if err != nil {
-			return err
-		}
-		if !isTuple(pattern) {
-			return errBadPattern
-		}
+	pattern, err := resolvePattern(fs.Args(), &f, true)
+	if err != nil {
+		return err
 	}
 	space := tupleSpace{path: f.space}
-	count, err := space.count(pattern)
+	count, err := space.count(pattern, f.keys)
 	if err != nil {
 		return err
 	}
@@ -194,15 +185,12 @@ func runClip(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	pattern, err := readJSONInput(fs.Args(), f.input, f.inputFile, false)
+	pattern, err := resolvePattern(fs.Args(), &f, true)
 	if err != nil {
 		return err
 	}
-	if !isTuple(pattern) {
-		return errBadPattern
-	}
 	space := tupleSpace{path: f.space}
-	count, err := space.clip(pattern)
+	count, err := space.clip(pattern, f.keys)
 	if err != nil {
 		return err
 	}
@@ -218,6 +206,28 @@ func addCommonFlags(fs *flag.FlagSet, f *commandFlags) {
 	fs.StringVar(&f.input, "json", "", "JSON tuple/template; alternatively provide it as the final argument or on stdin")
 	fs.StringVar(&f.inputFile, "file", "", "read the JSON tuple/template from this file")
 	fs.BoolVar(&f.pretty, "pretty", false, "pretty-print JSON output")
+	fs.Var(&f.keys, "k", "dot-path key-value filter (e.g. -k status=raw -k meta.team=infra); repeatable")
+	fs.Var(&f.keys, "key", "dot-path key-value filter (e.g. --key status=raw); repeatable")
+}
+
+func resolvePattern(args []string, f *commandFlags, allowEmpty bool) (json.RawMessage, error) {
+	hasKeyFilters := len(f.keys) > 0
+	if len(args) == 0 && f.input == "" && f.inputFile == "" {
+		if allowEmpty || hasKeyFilters {
+			return nil, nil
+		}
+	}
+	pattern, err := readJSONInput(args, f.input, f.inputFile, false)
+	if err != nil {
+		if (allowEmpty || hasKeyFilters) && (len(args) == 0 && f.input == "" && f.inputFile == "") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if pattern != nil && !isTuple(pattern) {
+		return nil, errBadPattern
+	}
+	return pattern, nil
 }
 
 func readJSONInput(args []string, inline, filename string, allowStdin bool) (json.RawMessage, error) {
@@ -314,12 +324,12 @@ func (s tupleSpace) mutate(fn func(*fileState) error) error {
 	})
 }
 
-func (s tupleSpace) find(ctx context.Context, pattern json.RawMessage, remove bool) (json.RawMessage, bool, error) {
+func (s tupleSpace) find(ctx context.Context, pattern json.RawMessage, keys keyValueFilters, remove bool) (json.RawMessage, bool, error) {
 	var result json.RawMessage
 	var found bool
 	err := withLockedFile(s.path, remove, func(file *os.File, state *fileState) error {
 		for i, candidate := range state.Tuples {
-			ok, err := matches(pattern, candidate)
+			ok, err := tupleMatches(pattern, keys, candidate)
 			if err != nil {
 				return err
 			}
@@ -339,15 +349,11 @@ func (s tupleSpace) find(ctx context.Context, pattern json.RawMessage, remove bo
 	return result, found, err
 }
 
-func (s tupleSpace) count(pattern json.RawMessage) (int, error) {
+func (s tupleSpace) count(pattern json.RawMessage, keys keyValueFilters) (int, error) {
 	count := 0
 	err := withLockedFile(s.path, false, func(_ *os.File, state *fileState) error {
 		for _, candidate := range state.Tuples {
-			if pattern == nil {
-				count++
-				continue
-			}
-			ok, err := matches(pattern, candidate)
+			ok, err := tupleMatches(pattern, keys, candidate)
 			if err != nil {
 				return err
 			}
@@ -360,12 +366,12 @@ func (s tupleSpace) count(pattern json.RawMessage) (int, error) {
 	return count, err
 }
 
-func (s tupleSpace) clip(pattern json.RawMessage) (int, error) {
+func (s tupleSpace) clip(pattern json.RawMessage, keys keyValueFilters) (int, error) {
 	removed := 0
 	err := withLockedFile(s.path, true, func(file *os.File, state *fileState) error {
 		kept := state.Tuples[:0]
 		for _, candidate := range state.Tuples {
-			ok, err := matches(pattern, candidate)
+			ok, err := tupleMatches(pattern, keys, candidate)
 			if err != nil {
 				return err
 			}
@@ -382,6 +388,22 @@ func (s tupleSpace) clip(pattern json.RawMessage) (int, error) {
 		return nil
 	})
 	return removed, err
+}
+
+func tupleMatches(pattern json.RawMessage, keys keyValueFilters, candidate json.RawMessage) (bool, error) {
+	if pattern != nil {
+		ok, err := matches(pattern, candidate)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	if len(keys) > 0 {
+		ok, err := matchKeyValues(keys, candidate)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func withLockedFile(path string, exclusive bool, fn func(*os.File, *fileState) error) error {
@@ -536,15 +558,15 @@ Usage:
 
 Commands:
   out      Add one JSON object or array tuple to the space.
-  in       Remove and print the first tuple matching a JSON template.
+  in       Remove and print the first tuple matching a JSON template / key flags.
   rd       Read (without removing) the first matching tuple. Alias: read.
-  count    Print the number of tuples, optionally matching a template.
-  clip     Remove all tuples matching a template and print the number removed.
+  count    Print the number of tuples, optionally matching a template / key flags.
+  clip     Remove all tuples matching a template / key flags and print the number removed.
 
-Matching:
-  Templates are recursive subsets. Every template object key must exist in the
-  candidate with the same value; nested objects are matched the same way.
-  Arrays match by position and length. Scalar values must match exactly.
+Matching & Key Flags:
+  Templates are recursive subsets. Alternatively or additionally, use repeatable
+  -k or --key <dot.path>=<value> flags to match nested fields without JSON templates.
+  Example: -k status=raw -k meta.team=infra
 
 Input:
   JSON may be the final argument, --json VALUE, --file PATH, or stdin.
@@ -559,10 +581,10 @@ Blocking:
 
 Examples:
   linda-space out --space /tmp/jobs.json '{"type":"job","status":"raw"}'
-  linda-space in --space /tmp/jobs.json --wait 30s --fail-on-none '{"status":"raw"}'
-  linda-space rd --space /tmp/jobs.json '{"type":"job"}'
-  linda-space count --space /tmp/jobs.json '{"status":"raw"}'
-  linda-space clip --space /tmp/jobs.json '{"status":"done"}'
+  linda-space in --space /tmp/jobs.json -k status=raw -k meta.team=infra
+  linda-space rd --space /tmp/jobs.json --wait 30s --fail-on-none '{"type":"job"}'
+  linda-space count --space /tmp/jobs.json -k status=raw
+  linda-space clip --space /tmp/jobs.json -k status=done
 
 Exit status:
   0 success (including a non-matching in/rd unless --fail-on-none is set)
