@@ -1,7 +1,7 @@
 # Spec 006: Internal System Envelope (_system)
 
 ## Overview
-Wrap incoming tuples in an internal system envelope (`_system`) while keeping user payloads clean, and introduce an `--envelope` flag and absolute expiration support.
+Wrap incoming tuples in an internal system envelope (`_system`) while keeping user payloads clean, introduce an `--envelope` flag, and support absolute expiration.
 
 ## Requirements & Mini-Spec
 1. **The System Envelope Structure**:
@@ -24,10 +24,10 @@ Wrap incoming tuples in an internal system envelope (`_system`) while keeping us
    - **Execution:** Generated atomically under the space file lock upon every `out()` operation.
 3. **Absolute Expiration (`--expires`)**:
    - `out` supports an optional `--expires <duration>` (e.g., `--expires 2h`) or absolute ISO timestamp.
-   - Stamps `_system.expires_at`. If `now() > expires_at` during a scan, the lazy sweeper drops/retire the tuple permanently instead of reinflating it.
-4. **Visibility & Lazy Sweeping (SQLite Style)**:
-   - `in` and `rd` **ignore** tuples where `hidden: true` or where `lease_expires` / `expires_at` are in the past.
-   - **No background processes / daemon tickers**: Expiration and lease sweeps happen **lazily** on the fly during the next incoming `in` or `rd` scan when candidate tuples are evaluated.
+   - Stamps `_system.expires_at`. When the explicit `sweep` command runs, any tuple where `now() > expires_at` is permanently dropped/retired from the space.
+4. **Passive Read Filtering (No Inline Sweeps)**:
+   - `in` and `rd` perform **passive filtering**: they simply ignore tuples where `hidden: true`, `lease_expires` has passed, or `expires_at` has passed. They never perform inline write mutations during reads, preventing shared read-lock (`LOCK_SH`) write deadlocks.
+   - **Explicit Cleanup via `sweep`:** A dedicated maintenance command (`linda-space sweep`) acquires an exclusive lock (`LOCK_EX`) to reinflate expired leases and purge hard-expired records. This is designed to be run periodically via a system cron job or background worker.
 5. **The `--envelope` Flag**:
    - By default, commands output only the inner `payload` for backward compatibility.
    - When `--envelope` (`-e`) is passed, the complete JSON envelope including `_system` metadata is returned to `stdout`.
