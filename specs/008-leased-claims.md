@@ -1,7 +1,7 @@
 # Spec 008: Leased Claims (lin) & TTL / Expiration Reinflation
 
 ## Overview
-Implement leased claims where claimed tasks are temporarily hidden from normal `in`/`rd` queries with automatic TTL reinflation if workers crash, along with precise mechanics for extending leases, early release, and finalization.
+Implement leased claims where claimed tasks are temporarily hidden from normal `in`/`rd` queries with automatic TTL reinflation if workers crash, along with precise mechanics for extending leases, early release, absolute expiration, and finalization.
 
 ## Requirements & Mini-Spec
 
@@ -40,8 +40,10 @@ When a worker finishes processing an item completely, it retires the task:
   ```bash
   linda-space delete --uuid sys-a1b2c3d4
   ```
-  *(Permanently removes the tuple record from the space and journal).*
+  *(Note: `delete --uuid` is syntactic sugar for an unqualified `in` filtered strictly by `--uuid sys-a1b2c3d4`, permanently removing the record from space and journal).*
 
-### 4. Crash Recovery (Lazy Reinflation)
+### 4. Crash Recovery & Absolute Expiration (Lazy Sweeping)
 - **Mechanism:** No background ticker threads (SQLite style). 
-- **Execution:** When any incoming `in` or `rd` command runs, the engine inspects candidate tuples. If a tuple's `_system.lease_expires` timestamp has passed (`now() > lease_expires`), the engine treats it as abandoned, automatically clears the lease, sets `_system.hidden = false`, and reinflates it back into active visibility for other workers to claim.
+- **Execution:** When any incoming `in` or `rd` command runs, the engine inspects candidate tuples:
+  1. **Absolute Expiration (`expires_at`):** If `now() > expires_at`, the engine permanently drops/retires the tuple from the space (ignoring it completely).
+  2. **Lease Expiration (`lease_expires`):** If `now() > lease_expires` (and `expires_at` has not passed), the engine treats the task as abandoned by a crashed worker, automatically clears the lease, sets `_system.hidden = false`, and reinflates it back into active visibility for other workers to claim.
