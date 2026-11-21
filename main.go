@@ -48,6 +48,12 @@ type commandFlags struct {
 	fail      bool
 	pretty    bool
 	keys      keyValueFilters
+	envelope  bool
+	expires   string
+	lease     string
+	release   bool
+	uuid      string
+	template  string
 }
 
 func main() {
@@ -66,6 +72,12 @@ func main() {
 		err = runTake(args, true)
 	case "rd", "read":
 		err = runTake(args, false)
+	case "update":
+		err = runUpdate(args)
+	case "delete":
+		err = runDelete(args)
+	case "sweep":
+		err = runSweep(args)
 	case "count":
 		err = runCount(args)
 	case "clip":
@@ -89,6 +101,7 @@ func runOut(args []string) error {
 	fs.SetOutput(os.Stderr)
 	var f commandFlags
 	addCommonFlags(fs, &f)
+	fs.StringVar(&f.expires, "expires", "", "tuple expiration duration (e.g. 2h, 30m) or absolute ISO timestamp")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -102,10 +115,18 @@ func runOut(args []string) error {
 		return errBadTuple
 	}
 	space := tupleSpace{path: f.space}
-	return space.mutate(func(state *fileState) error {
-		state.Tuples = append(state.Tuples, cloneRaw(payload))
-		return nil
-	})
+	rec, err := space.deposit(payload, f.expires)
+	if err != nil {
+		return err
+	}
+	if f.envelope {
+		raw, err := marshalRecord(rec)
+		if err != nil {
+			return err
+		}
+		return writeJSON(os.Stdout, raw, f.pretty)
+	}
+	return nil
 }
 
 func runTake(args []string, remove bool) error {
@@ -119,6 +140,11 @@ func runTake(args []string, remove bool) error {
 	addCommonFlags(fs, &f)
 	fs.DurationVar(&f.wait, "wait", 0, "wait up to this duration for a match (0 means do not wait; use 0s for a non-blocking check)")
 	fs.BoolVar(&f.fail, "fail-on-none", false, "exit 1 when no matching tuple is available before --wait expires")
+	fs.StringVar(&f.template, "template", "", "JSON pattern template to match")
+	fs.StringVar(&f.uuid, "uuid", "", "system UUID to match")
+	if remove {
+		fs.StringVar(&f.lease, "lease", "", "claim tuple with lease duration (e.g. 60s, +60s)")
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -128,6 +154,18 @@ func runTake(args []string, remove bool) error {
 	if err != nil {
 		return err
 	}
+	var leaseDur time.Duration
+	if remove && f.lease != "" {
+		cleanLease := strings.TrimPrefix(f.lease, "+")
+		dur, err := time.ParseDuration(cleanLease)
+		if err != nil {
+			return fmt.Errorf("invalid --lease duration: %w", err)
+		}
+		if dur <= 0 {
+			return errors.New("--lease duration must be positive")
+		}
+		leaseDur = dur
+	}
 	space := tupleSpace{path: f.space}
 	ctx := context.Background()
 	if f.wait > 0 {
@@ -135,13 +173,26 @@ func runTake(args []string, remove bool) error {
 		ctx, cancel = context.WithTimeout(ctx, f.wait)
 		defer cancel()
 	}
+	target := TargetSpec{
+		UUID:        f.uuid,
+		Pattern:     pattern,
+		Keys:        f.keys,
+		AllowHidden: (f.uuid != "" && remove && leaseDur == 0),
+	}
 	for {
-		result, found, err := space.find(ctx, pattern, f.keys, remove)
+		rec, found, err := space.findOne(ctx, target, leaseDur, remove)
 		if err != nil {
 			return err
 		}
 		if found {
-			return writeJSON(os.Stdout, result, f.pretty)
+			if f.envelope {
+				raw, err := marshalRecord(rec)
+				if err != nil {
+					return err
+				}
+				return writeJSON(os.Stdout, raw, f.pretty)
+			}
+			return writeJSON(os.Stdout, rec.Payload, f.pretty)
 		}
 		if f.wait <= 0 {
 			if f.fail {
@@ -161,11 +212,201 @@ func runTake(args []string, remove bool) error {
 	}
 }
 
+func runUpdate(args []string) error {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var f commandFlags
+	addCommonFlags(fs, &f)
+	fs.StringVar(&f.uuid, "uuid", "", "target tuple system UUID")
+	fs.StringVar(&f.template, "template", "", "target pattern template")
+	fs.StringVar(&f.lease, "lease", "", "extend lease duration (e.g. +60s or 60s)")
+	fs.BoolVar(&f.release, "release", false, "release leased tuple back to active queue")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	f.resolveSpace()
+	f.logVerbose()
+
+	if f.release && f.lease != "" {
+		return errors.New("cannot specify both --lease and --release")
+	}
+
+	var target TargetSpec
+	target.UUID = f.uuid
+	target.Keys = f.keys
+
+	posArgs := fs.Args()
+	if f.template != "" {
+		pat, err := normalizeJSON([]byte(f.template))
+		if err != nil {
+			return fmt.Errorf("invalid --template: %w", err)
+		}
+		if !isTuple(pat) {
+			return errBadPattern
+		}
+		target.Pattern = pat
+	} else if f.uuid == "" && len(posArgs) > 0 {
+		pat, err := normalizeJSON([]byte(posArgs[0]))
+		if err != nil {
+			return fmt.Errorf("invalid template argument: %w", err)
+		}
+		if !isTuple(pat) {
+			return errBadPattern
+		}
+		target.Pattern = pat
+		posArgs = posArgs[1:]
+	}
+
+	if target.UUID == "" && target.Pattern == nil && len(target.Keys) == 0 {
+		return errors.New("update requires --uuid or a pattern template/key filter")
+	}
+
+	var mods updateModOptions
+	if f.release {
+		mods.Release = true
+	} else if f.lease != "" {
+		mods.HasLease = true
+		mods.LeaseExt = f.lease
+	}
+
+	var newPayload json.RawMessage
+	if f.input != "" {
+		p, err := normalizeJSON([]byte(f.input))
+		if err != nil {
+			return fmt.Errorf("invalid --json: %w", err)
+		}
+		newPayload = p
+	} else if f.inputFile != "" {
+		data, err := os.ReadFile(f.inputFile)
+		if err != nil {
+			return fmt.Errorf("read JSON file: %w", err)
+		}
+		p, err := normalizeJSON(data)
+		if err != nil {
+			return err
+		}
+		newPayload = p
+	} else if f.uuid != "" && len(posArgs) == 1 {
+		p, err := normalizeJSON([]byte(posArgs[0]))
+		if err != nil {
+			return fmt.Errorf("invalid payload argument: %w", err)
+		}
+		newPayload = p
+		posArgs = nil
+	} else if len(posArgs) > 0 {
+		return errors.New("too many positional arguments for update")
+	}
+
+	if newPayload != nil {
+		if !isTuple(newPayload) {
+			return errBadTuple
+		}
+		mods.NewPayload = newPayload
+		mods.HasPayload = true
+	}
+
+	if !mods.HasPayload && !mods.HasLease && !mods.Release {
+		return errors.New("update requires at least one of --json, --lease, or --release")
+	}
+
+	space := tupleSpace{path: f.space}
+	updatedRec, err := space.update(target, mods)
+	if err != nil {
+		return err
+	}
+
+	if f.envelope {
+		raw, err := marshalRecord(updatedRec)
+		if err != nil {
+			return err
+		}
+		return writeJSON(os.Stdout, raw, f.pretty)
+	}
+	return writeJSON(os.Stdout, updatedRec.Payload, f.pretty)
+}
+
+func runDelete(args []string) error {
+	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var f commandFlags
+	addCommonFlags(fs, &f)
+	fs.StringVar(&f.uuid, "uuid", "", "target tuple system UUID to delete")
+	fs.StringVar(&f.template, "template", "", "target pattern template to delete")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	f.resolveSpace()
+	f.logVerbose()
+
+	var target TargetSpec
+	if f.uuid != "" {
+		target = TargetSpec{
+			UUID:        f.uuid,
+			AllowHidden: true,
+		}
+	} else {
+		pattern, err := resolvePattern(fs.Args(), &f, false)
+		if err != nil {
+			return err
+		}
+		if pattern == nil && len(f.keys) == 0 {
+			return errors.New("delete requires --uuid or a template/key filter")
+		}
+		target = TargetSpec{
+			Pattern: pattern,
+			Keys:    f.keys,
+		}
+	}
+
+	space := tupleSpace{path: f.space}
+	rec, found, err := space.findOne(context.Background(), target, 0, true)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errNoMatch
+	}
+
+	if f.envelope {
+		raw, err := marshalRecord(rec)
+		if err != nil {
+			return err
+		}
+		return writeJSON(os.Stdout, raw, f.pretty)
+	}
+	return writeJSON(os.Stdout, rec.Payload, f.pretty)
+}
+
+func runSweep(args []string) error {
+	fs := flag.NewFlagSet("sweep", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var f commandFlags
+	addCommonFlags(fs, &f)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	f.resolveSpace()
+	f.logVerbose()
+
+	space := tupleSpace{path: f.space}
+	res, err := space.sweep()
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		return err
+	}
+	return writeJSON(os.Stdout, raw, f.pretty)
+}
+
 func runCount(args []string) error {
 	fs := flag.NewFlagSet("count", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var f commandFlags
 	addCommonFlags(fs, &f)
+	fs.StringVar(&f.template, "template", "", "JSON pattern template to match")
+	fs.StringVar(&f.uuid, "uuid", "", "system UUID to match")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -190,6 +431,8 @@ func runClip(args []string) error {
 	var f commandFlags
 	addCommonFlags(fs, &f)
 	fs.BoolVar(&f.fail, "fail-on-none", false, "exit 1 when no matching tuple is available")
+	fs.StringVar(&f.template, "template", "", "JSON pattern template to match")
+	fs.StringVar(&f.uuid, "uuid", "", "system UUID to match")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -215,11 +458,13 @@ func addCommonFlags(fs *flag.FlagSet, f *commandFlags) {
 	fs.StringVar(&f.space, "space", "", "path to the shared JSON tuple-space file (defaults to SPACE_FILE env var or ./linda-space.json)")
 	fs.BoolVar(&f.verbose, "v", false, "print resolved storage path to stderr")
 	fs.BoolVar(&f.verbose, "verbose", false, "print resolved storage path to stderr")
-	fs.StringVar(&f.input, "json", "", "JSON tuple/template; alternatively provide it as the final argument or on stdin")
+	fs.StringVar(&f.input, "json", "", "JSON tuple/template/payload; alternatively provide it as the final argument or on stdin")
 	fs.StringVar(&f.inputFile, "file", "", "read the JSON tuple/template from this file")
 	fs.BoolVar(&f.pretty, "pretty", false, "pretty-print JSON output")
 	fs.Var(&f.keys, "k", "dot-path key-value filter (e.g. -k status=raw -k meta.team=infra); repeatable")
 	fs.Var(&f.keys, "key", "dot-path key-value filter (e.g. --key status=raw); repeatable")
+	fs.BoolVar(&f.envelope, "e", false, "output complete JSON envelope including _system metadata")
+	fs.BoolVar(&f.envelope, "envelope", false, "output complete JSON envelope including _system metadata")
 }
 
 func (f *commandFlags) resolveSpace() {
@@ -241,14 +486,27 @@ func (f *commandFlags) logVerbose() {
 
 func resolvePattern(args []string, f *commandFlags, allowEmpty bool) (json.RawMessage, error) {
 	hasKeyFilters := len(f.keys) > 0
-	if len(args) == 0 && f.input == "" && f.inputFile == "" {
-		if allowEmpty || hasKeyFilters {
+	if len(args) == 0 && f.input == "" && f.inputFile == "" && f.template == "" {
+		if allowEmpty || hasKeyFilters || f.uuid != "" {
 			return nil, nil
 		}
 	}
+	if f.template != "" {
+		if f.input != "" || len(args) > 0 || f.inputFile != "" {
+			return nil, errors.New("use only one of --template, positional JSON, --json, or --file")
+		}
+		pat, err := normalizeJSON([]byte(f.template))
+		if err != nil {
+			return nil, err
+		}
+		if !isTuple(pat) {
+			return nil, errBadPattern
+		}
+		return pat, nil
+	}
 	pattern, err := readJSONInput(args, f.input, f.inputFile, false)
 	if err != nil {
-		if (allowEmpty || hasKeyFilters) && (len(args) == 0 && f.input == "" && f.inputFile == "") {
+		if (allowEmpty || hasKeyFilters || f.uuid != "") && (len(args) == 0 && f.input == "" && f.inputFile == "") {
 			return nil, nil
 		}
 		return nil, err
@@ -365,36 +623,11 @@ func decodeValue(raw json.RawMessage) (any, error) {
 }
 
 func (s tupleSpace) find(ctx context.Context, pattern json.RawMessage, keys keyValueFilters, remove bool) (json.RawMessage, bool, error) {
-	var result json.RawMessage
-	var found bool
-	var decodedPattern any
-	if pattern != nil {
-		var err error
-		decodedPattern, err = decodeValue(pattern)
-		if err != nil {
-			return nil, false, fmt.Errorf("decode template: %w", err)
-		}
+	rec, found, err := s.findOne(ctx, TargetSpec{Pattern: pattern, Keys: keys}, 0, remove)
+	if err != nil || !found {
+		return nil, found, err
 	}
-	err := withLockedFile(s.path, remove, func(file *os.File, state *fileState) error {
-		for i, candidate := range state.Tuples {
-			ok, err := tupleMatchesDecoded(decodedPattern, keys, candidate)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				continue
-			}
-			result = cloneRaw(candidate)
-			found = true
-			if remove {
-				state.Tuples = append(state.Tuples[:i], state.Tuples[i+1:]...)
-				return writeState(file, state)
-			}
-			return nil
-		}
-		return nil
-	})
-	return result, found, err
+	return rec.Payload, true, nil
 }
 
 func (s tupleSpace) count(pattern json.RawMessage, keys keyValueFilters) (int, error) {
@@ -408,8 +641,16 @@ func (s tupleSpace) count(pattern json.RawMessage, keys keyValueFilters) (int, e
 		}
 	}
 	err := withLockedFile(s.path, false, func(_ *os.File, state *fileState) error {
-		for _, candidate := range state.Tuples {
-			ok, err := tupleMatchesDecoded(decodedPattern, keys, candidate)
+		now := time.Now().UTC()
+		for _, raw := range state.Tuples {
+			rec, err := parseRecord(raw, now)
+			if err != nil {
+				return err
+			}
+			if !isRecordAvailable(&rec.System, now) {
+				continue
+			}
+			ok, err := matchCandidatePayload(decodedPattern, keys, &rec)
 			if err != nil {
 				return err
 			}
@@ -433,9 +674,18 @@ func (s tupleSpace) clip(pattern json.RawMessage, keys keyValueFilters) (int, er
 		}
 	}
 	err := withLockedFile(s.path, true, func(file *os.File, state *fileState) error {
+		now := time.Now().UTC()
 		kept := state.Tuples[:0]
-		for _, candidate := range state.Tuples {
-			ok, err := tupleMatchesDecoded(decodedPattern, keys, candidate)
+		for _, raw := range state.Tuples {
+			rec, err := parseRecord(raw, now)
+			if err != nil {
+				return err
+			}
+			if !isRecordAvailable(&rec.System, now) {
+				kept = append(kept, raw)
+				continue
+			}
+			ok, err := matchCandidatePayload(decodedPattern, keys, &rec)
 			if err != nil {
 				return err
 			}
@@ -443,7 +693,7 @@ func (s tupleSpace) clip(pattern json.RawMessage, keys keyValueFilters) (int, er
 				removed++
 				continue
 			}
-			kept = append(kept, candidate)
+			kept = append(kept, raw)
 		}
 		state.Tuples = kept
 		if removed > 0 {
@@ -679,11 +929,26 @@ Usage:
   linda-space <command> [options] [JSON]
 
 Commands:
-  out      Add one JSON object or array tuple to the space.
-  in       Remove and print the first tuple matching a JSON template / key flags.
+  out      Add one JSON object or array tuple to the space (supports --expires and -e/--envelope).
+  in       Remove and print the first tuple matching a JSON template / key flags (supports --lease and -e/--envelope).
   rd       Read (without removing) the first matching tuple. Alias: read.
-  count    Print the number of tuples, optionally matching a template / key flags.
-  clip     Remove all tuples matching a template / key flags and print the number removed.
+  update   Atomically modify a tuple's payload and/or lease state (--uuid or --template).
+  delete   Permanently remove a tuple by system UUID (--uuid) or pattern.
+  sweep    Administrative maintenance: purge hard-expired tuples and reinflate expired leases.
+  count    Print the number of available tuples, optionally matching a template / key flags.
+  clip     Remove all matching available tuples and print the number removed.
+
+Flags:
+  -e, --envelope   Output complete JSON envelope including _system metadata.
+  --expires DURATION/TIME  Set absolute expiration for deposited tuple (out).
+  --lease DURATION         Claim with lease (in) or extend lease (update).
+  --release                Release leased tuple back to active queue (update).
+  --uuid UUID              Target tuple by system UUID (update, delete, in, rd).
+  --template JSON          Specify JSON template pattern for matching.
+  --json JSON              Input tuple, payload, or template.
+  --wait DURATION          Wait up to this duration for a match (in, rd).
+  --fail-on-none           Exit 1 when no matching tuple is found (in, rd, clip).
+  -k, --key PATH=VALUE     Dot-path key-value filter (repeatable).
 
 Matching & Key Flags:
   Templates are recursive subsets. Alternatively or additionally, use repeatable
@@ -705,7 +970,12 @@ Blocking:
 
 Examples:
   linda-space out --space /tmp/jobs.json '{"type":"job","status":"raw"}'
-  linda-space in --space /tmp/jobs.json -k status=raw -k meta.team=infra
+  linda-space in --space /tmp/jobs.json --envelope --lease 60s -k status=raw
+  linda-space update --space /tmp/jobs.json --uuid sys-a1b2c3d4 --lease +60s
+  linda-space update --space /tmp/jobs.json --uuid sys-a1b2c3d4 --json '{"status":"done"}'
+  linda-space update --space /tmp/jobs.json --uuid sys-a1b2c3d4 --release --json '{"status":"open"}'
+  linda-space delete --space /tmp/jobs.json --uuid sys-a1b2c3d4
+  linda-space sweep --space /tmp/jobs.json
   linda-space rd --space /tmp/jobs.json --wait 30s --fail-on-none '{"type":"job"}'
   linda-space count --space /tmp/jobs.json -k status=raw
   linda-space clip --space /tmp/jobs.json -k status=done
