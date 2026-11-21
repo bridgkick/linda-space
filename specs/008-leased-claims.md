@@ -1,7 +1,7 @@
 # Spec 008: Leased Claims (lin) & TTL / Expiration Reinflation
 
 ## Overview
-Implement leased claims where claimed tasks are temporarily hidden from normal `in`/`rd` queries with automatic TTL reinflation if workers crash, along with precise mechanics for extending leases and finalization.
+Implement leased claims where claimed tasks are temporarily hidden from normal `in`/`rd` queries with automatic TTL reinflation if workers crash, along with precise mechanics for extending leases, early release, and finalization.
 
 ## Requirements & Mini-Spec
 
@@ -16,22 +16,27 @@ Implement leased claims where claimed tasks are temporarily hidden from normal `
   3. Sets `_system.lease_expires = now() + 60s`.
   4. Returns the full envelope containing the assigned system UUID (`sys-a1b2c3d4`).
 
-### 2. Extending the Lease (Heartbeat / Progress)
-- **Action:** If a task takes longer than expected, the worker extends its lease via the `update` command using its system UUID:
+### 2. Managing Leases via `update`
+Workers can manage lease states during task execution using three distinct flag patterns on `update`:
+- **Heartbeat / Extend:**
   ```bash
   linda-space update --uuid sys-a1b2c3d4 --lease +60s
   ```
-- **Engine Behavior:**
-  - Locks the space, verifies the tuple exists and is still active under this lease (i.e. not already expired or reclaimed), and pushes `_system.lease_expires` forward by the specified duration.
+  *(Pushes `_system.lease_expires` forward; keeps tuple hidden).*
+- **Modify & Retain Lease:**
+  ```bash
+  linda-space update --uuid sys-a1b2c3d4 --json '{"task": "compile", "status": "running"}'
+  ```
+  *(Swaps user payload; preserves existing active lease and hidden status).*
+- **Modify & Release Back to Queue (Early Release):**
+  ```bash
+  linda-space update --uuid sys-a1b2c3d4 --release --json '{"task": "compile", "status": "reviewing"}'
+  ```
+  *(Swaps payload, un-hides the tuple by setting `_system.hidden = false`, and clears `_system.lease_expires = null` so another worker can claim it).*
 
 ### 3. Finalization & Deletion (Task Completion)
-When the worker finishes processing the item, it disposes of or transitions the task using one of two methods:
-- **Option A: Mark Complete / Transition State (CAS Update)**
-  ```bash
-  linda-space update --uuid sys-a1b2c3d4 --json '{"task": "compile", "status": "complete"}'
-  ```
-  *(Atomically updates the user payload and clears or archives the lease/hidden state).*
-- **Option B: Permanent Deletion (Consume & Retire)**
+When a worker finishes processing an item completely, it retires the task:
+- **Permanent Deletion (Consume & Retire):**
   ```bash
   linda-space delete --uuid sys-a1b2c3d4
   ```
