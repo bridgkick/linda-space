@@ -21,6 +21,7 @@ import (
 
 const (
 	defaultSpacePath = "linda-space.json"
+	spaceEnvVar      = "SPACE_FILE"
 	pollInterval     = 100 * time.Millisecond
 )
 
@@ -40,6 +41,7 @@ type fileState struct {
 
 type commandFlags struct {
 	space     string
+	verbose   bool
 	input     string
 	inputFile string
 	wait      time.Duration
@@ -90,6 +92,8 @@ func runOut(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	f.resolveSpace()
+	f.logVerbose()
 	payload, err := readJSONInput(fs.Args(), f.input, f.inputFile, true)
 	if err != nil {
 		return err
@@ -118,6 +122,8 @@ func runTake(args []string, remove bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	f.resolveSpace()
+	f.logVerbose()
 	pattern, err := resolvePattern(fs.Args(), &f, true)
 	if err != nil {
 		return err
@@ -163,6 +169,8 @@ func runCount(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	f.resolveSpace()
+	f.logVerbose()
 	pattern, err := resolvePattern(fs.Args(), &f, true)
 	if err != nil {
 		return err
@@ -185,6 +193,8 @@ func runClip(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	f.resolveSpace()
+	f.logVerbose()
 	pattern, err := resolvePattern(fs.Args(), &f, true)
 	if err != nil {
 		return err
@@ -202,12 +212,31 @@ func runClip(args []string) error {
 }
 
 func addCommonFlags(fs *flag.FlagSet, f *commandFlags) {
-	fs.StringVar(&f.space, "space", defaultSpacePath, "path to the shared JSON tuple-space file")
+	fs.StringVar(&f.space, "space", "", "path to the shared JSON tuple-space file (defaults to SPACE_FILE env var or ./linda-space.json)")
+	fs.BoolVar(&f.verbose, "v", false, "print resolved storage path to stderr")
+	fs.BoolVar(&f.verbose, "verbose", false, "print resolved storage path to stderr")
 	fs.StringVar(&f.input, "json", "", "JSON tuple/template; alternatively provide it as the final argument or on stdin")
 	fs.StringVar(&f.inputFile, "file", "", "read the JSON tuple/template from this file")
 	fs.BoolVar(&f.pretty, "pretty", false, "pretty-print JSON output")
 	fs.Var(&f.keys, "k", "dot-path key-value filter (e.g. -k status=raw -k meta.team=infra); repeatable")
 	fs.Var(&f.keys, "key", "dot-path key-value filter (e.g. --key status=raw); repeatable")
+}
+
+func (f *commandFlags) resolveSpace() {
+	if f.space != "" {
+		return
+	}
+	if env := os.Getenv(spaceEnvVar); env != "" {
+		f.space = env
+		return
+	}
+	f.space = defaultSpacePath
+}
+
+func (f *commandFlags) logVerbose() {
+	if f.verbose {
+		fmt.Fprintf(os.Stderr, "storage: %s\n", f.space)
+	}
 }
 
 func resolvePattern(args []string, f *commandFlags, allowEmpty bool) (json.RawMessage, error) {
@@ -664,7 +693,9 @@ Matching & Key Flags:
 Input:
   JSON may be the final argument, --json VALUE, --file PATH, or stdin.
   A tuple is a top-level JSON object or array. The default space is
-  ./linda-space.json; use --space PATH to share a different file.
+  ./linda-space.json, unless overridden by the SPACE_FILE environment variable
+  or the --space PATH flag. Use -v or --verbose to inspect the resolved storage
+  path on stderr.
 
 Blocking:
   in and rd check immediately by default. --wait DURATION enables long-polling

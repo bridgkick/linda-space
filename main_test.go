@@ -363,4 +363,147 @@ func TestConcurrentAtomicMutationsUnderLock(t *testing.T) {
 	}
 }
 
+func TestStoragePathResolution(t *testing.T) {
+	origEnv, hadEnv := os.LookupEnv("SPACE_FILE")
+	defer func() {
+		if hadEnv {
+			os.Setenv("SPACE_FILE", origEnv)
+		} else {
+			os.Unsetenv("SPACE_FILE")
+		}
+	}()
+
+	t.Run("default fallback", func(t *testing.T) {
+		os.Unsetenv("SPACE_FILE")
+		var f commandFlags
+		f.resolveSpace()
+		if f.space != defaultSpacePath {
+			t.Fatalf("expected default %q, got %q", defaultSpacePath, f.space)
+		}
+	})
+
+	t.Run("SPACE_FILE env var used when no flag", func(t *testing.T) {
+		os.Setenv("SPACE_FILE", "/env/path/space.json")
+		var f commandFlags
+		f.resolveSpace()
+		if f.space != "/env/path/space.json" {
+			t.Fatalf("expected env path %q, got %q", "/env/path/space.json", f.space)
+		}
+	})
+
+	t.Run("flag takes priority over SPACE_FILE env var", func(t *testing.T) {
+		os.Setenv("SPACE_FILE", "/env/path/space.json")
+		f := commandFlags{space: "/flag/path/space.json"}
+		f.resolveSpace()
+		if f.space != "/flag/path/space.json" {
+			t.Fatalf("expected flag path %q, got %q", "/flag/path/space.json", f.space)
+		}
+	})
+
+	t.Run("flag takes priority over default", func(t *testing.T) {
+		os.Unsetenv("SPACE_FILE")
+		f := commandFlags{space: "/flag/path/space.json"}
+		f.resolveSpace()
+		if f.space != "/flag/path/space.json" {
+			t.Fatalf("expected flag path %q, got %q", "/flag/path/space.json", f.space)
+		}
+	})
+}
+
+func TestVerboseOutput(t *testing.T) {
+	spacePath := filepath.Join(t.TempDir(), "verbose_space.json")
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	err := runOut([]string{"-v", "--space", spacePath, `{"msg":"hello"}`})
+	w.Close()
+	os.Stderr = oldStderr
+
+	if err != nil {
+		t.Fatalf("runOut failed: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	n, _ := r.Read(buf)
+	output := string(buf[:n])
+	expected := "storage: " + spacePath + "\n"
+	if output != expected {
+		t.Fatalf("expected stderr output %q, got %q", expected, output)
+	}
+
+	// Also test --verbose long flag
+	r2, w2, _ := os.Pipe()
+	os.Stderr = w2
+
+	err = runOut([]string{"--verbose", "--space", spacePath, `{"msg":"world"}`})
+	w2.Close()
+	os.Stderr = oldStderr
+
+	if err != nil {
+		t.Fatalf("runOut with --verbose failed: %v", err)
+	}
+
+	buf2 := make([]byte, 1024)
+	n2, _ := r2.Read(buf2)
+	output2 := string(buf2[:n2])
+	if output2 != expected {
+		t.Fatalf("expected stderr output %q, got %q", expected, output2)
+	}
+}
+
+func TestSpaceFileEnvVarEndToEnd(t *testing.T) {
+	spacePath := filepath.Join(t.TempDir(), "env_space.json")
+	origEnv, hadEnv := os.LookupEnv("SPACE_FILE")
+	defer func() {
+		if hadEnv {
+			os.Setenv("SPACE_FILE", origEnv)
+		} else {
+			os.Unsetenv("SPACE_FILE")
+		}
+	}()
+	os.Setenv("SPACE_FILE", spacePath)
+
+	// runOut without --space flag should use SPACE_FILE
+	if err := runOut([]string{`{"env":"tested"}`}); err != nil {
+		t.Fatalf("runOut using SPACE_FILE failed: %v", err)
+	}
+
+	// Verify tuple space file was created at spacePath
+	if _, err := os.Stat(spacePath); os.IsNotExist(err) {
+		t.Fatalf("expected file to exist at %s, but does not", spacePath)
+	}
+
+	// runTake without --space flag should read from SPACE_FILE
+	oldStdout := os.Stdout
+	rOut, wOut, _ := os.Pipe()
+	os.Stdout = wOut
+
+	err := runTake([]string{"-k", "env=tested"}, false)
+	wOut.Close()
+	os.Stdout = oldStdout
+
+	if err != nil {
+		t.Fatalf("runTake failed: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	n, _ := rOut.Read(buf)
+	if string(buf[:n]) != `{"env":"tested"}`+"\n" {
+		t.Fatalf("unexpected output: %s", string(buf[:n]))
+	}
+
+	// Explicit --space should override SPACE_FILE
+	overridePath := filepath.Join(t.TempDir(), "override_space.json")
+	if err := runOut([]string{"--space", overridePath, `{"override":true}`}); err != nil {
+		t.Fatalf("runOut with override space failed: %v", err)
+	}
+	if _, err := os.Stat(overridePath); os.IsNotExist(err) {
+		t.Fatalf("expected override file to exist at %s, but does not", overridePath)
+	}
+}
+
+
 

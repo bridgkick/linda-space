@@ -38,6 +38,13 @@ linda-space count --space /tmp/jobs.json '{"status":"raw"}'
 linda-space clip --space /tmp/jobs.json '{"status":"done"}'
 ```
 
+Storage location precedence:
+1. `--space PATH` flag
+2. `SPACE_FILE` environment variable
+3. `./linda-space.json` fallback
+
+Use `-v` or `--verbose` on any command to output the resolved storage path to `stderr` (preserving clean JSON on `stdout`).
+
 JSON can be passed as the final argument, with `--json`, with `--file`, or through stdin:
 
 ```sh
